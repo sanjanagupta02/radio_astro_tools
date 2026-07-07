@@ -14,28 +14,31 @@ Small, standalone tools for GMRT/uGMRT and VLA radio observations. Nothing here 
 
 ### What it does
 
-Runs against a measurement set you already have and prints a report covering:
+Runs against a measurement set (or, now, a raw FITS file, see below) and prints a report covering:
 
-- basic observation info and telescope identification (GMRT/uGMRT or VLA, auto-detected from the MS or set explicitly)
+- basic observation info and telescope identification (GMRT/uGMRT or VLA, auto-detected or set explicitly)
 - observing conditions (sun elevation, day/night/twilight during the track)
 - antennas present, flagged against the expected naming convention for the telescope
 - frequency setup: spectral windows, likely receiver band, known RFI overlap, and suggested imaging cell size / field of view / image size
 - polarization products and integration time
 - field classification (flux/bandpass calibrator, phase calibrator, target), using a shared VLA calibrator-list file
+- suggested `clipfluxcal`/`clipphasecal` amplitude ranges for `config_capture.ini`, computed from the real Perley & Butler (2017) expected flux of your flux calibrator at your actual center frequency, not a guessed number
 - field positions and calibrator-target angular separation
-- scan timing per field, including gaps and short-scan warnings
-- elevation (and airmass) during each field's track
-- current flagging status, with per-antenna and per-channel breakdowns to help spot a dead antenna or narrowband RFI
+- scan timing per field, including gaps and short-scan warnings (MS input only, see below)
+- elevation (and airmass) during each field's track (MS input only)
+- current flagging status, with per-antenna and per-channel breakdowns to help spot a dead antenna or narrowband RFI (MS input only); every channel above its spw's own median is shown, nothing is hidden behind the "notable spike" heuristic cutoff, that cutoff only decides which ones get flagged with `!`
 - self-calibration risk factors (low-frequency band, daytime/twilight track, no separate phase calibrator, large calibrator separation, low elevation, long uninterrupted scans), each backed by a real threshold (NRAO/VLBA calibration guide), not an arbitrary cutoff
 - a closing checklist of things to verify by hand
 
-It never modifies the MS. All CASA table/tool opens are read-only, and it never calls any flagging or calibration task that writes.
+It never modifies the MS, and in FITS mode never creates one either. All CASA table/tool opens are read-only, it never calls any flagging or calibration task that writes, and the only file it ever writes itself is the text report.
 
 ### How it operates
 
 Everything except the flagging-status section is read from lightweight CASA metadata tables (`msmetadata`, small subtable reads via `table`), so it's fast even on a large MS. The flagging-status section calls `flagdata(mode='summary')`, which does read the actual FLAG column and is the slow part of the script, see the `--nochanflags` flag below.
 
-A telescope "profile" (`TELESCOPE_PROFILES` in the script) supplies the instrument-specific knowledge: antenna naming pattern, receiver band edges, known RFI ranges, and standard calibrator names. GMRT/uGMRT and VLA/EVLA are included; adding another telescope means adding one more entry to that dict, nothing else in the script needs to change.
+A telescope "profile" (`TELESCOPE_PROFILES` in the script) supplies the instrument-specific knowledge: antenna naming pattern, receiver band edges, known RFI ranges, standard calibrator names, and (for FITS mode) known dish diameter. GMRT/uGMRT and VLA/EVLA are included; adding another telescope means adding one more entry to that dict, nothing else in the script needs to change.
+
+**FITS mode.** Point it at a `.fits`/`.FITS` file instead of an MS and it reads the file's own header and binary tables (AN, FQ, SU) directly, no MS is ever created. This needs the `astropy` package (`pip install astropy`), loaded lazily so MS-mode users don't need it. A raw FITS file doesn't have "scans" or "flags" yet, those only get built during MS import (CASA's `importgmrt`, the same task CAPTURE calls internally), so scan timing, elevation-during-track, current flagging status, and the scan-dependent self-cal risk factors aren't available in FITS mode, the report prints an explicit banner at the top listing exactly what's skipped. Everything else, antennas, frequency/band setup, suggested cell size/FOV/image size, field classification and positions, polarization products, clip-range suggestions, is read straight from the FITS file. UVFITS conventions can vary a bit by correlator vintage; this was validated against a synthetic file built to the standard AIPS convention, worth a sanity check against a real file's known antennas/frequency range the first time you use it.
 
 ### Usage
 
@@ -43,6 +46,9 @@ A telescope "profile" (`TELESCOPE_PROFILES` in the script) supplies the instrume
 casa -c read_listobs.py yourfile.ms
 casa -c read_listobs.py --telescope gmrt yourfile.ms
 casa -c read_listobs.py --telescope vla yourfile.ms
+
+# FITS input, no MS created:
+casa -c read_listobs.py --telescope gmrt yourfile.FITS
 ```
 
 Or from the CASA prompt:
@@ -52,7 +58,7 @@ MSNAME = 'yourfile.ms'
 execfile('read_listobs.py')
 ```
 
-If no filename is given and `MSNAME` is left as `None` at the top of the script, it looks for a single `*.ms`/`*.MS` directory in the current folder.
+If no filename is given and `MSNAME` is left as `None` at the top of the script, it looks for a single `*.ms`/`*.MS`/`*.fits`/`*.FITS` in the current folder (errors out if it finds more than one candidate, rather than guessing which you meant).
 
 Requires a `vla-cals.list` file (the VLA calibrator manual list) in the working directory to correctly identify phase calibrators, used by GMRT/uGMRT observers for the same purpose.
 
@@ -63,10 +69,16 @@ Output is printed to the terminal and also written to `read_listobs_report.txt` 
 | Flag | Effect |
 |---|---|
 | `--telescope gmrt` / `--telescope vla` | Override telescope auto-detection |
-| `--nochanflags` | Skip the per-channel flagging breakdown (much faster; skips the one part of the script that reads real visibility data instead of metadata) |
+| `--nochanflags` | Skip the per-channel flagging breakdown (much faster; skips the one part of the script that reads real visibility data instead of metadata; MS mode only) |
 | `--chanflags` | Force the per-channel breakdown on, overriding `CHECK_PERCHANNEL_FLAGS = False` in the script |
 
-`CHECK_PERCHANNEL_FLAGS` (top of script) sets the default for the per-channel breakdown if you don't pass either flag.
+`CHECK_PERCHANNEL_FLAGS` (top of script) sets the default for the per-channel breakdown if you don't pass either flag. `CLIP_MARGIN_FACTOR` and `RFI_SPIKE_SIGMA`/`RFI_SPIKE_FLOOR_PCT` (also top of script) are this script's own tunable heuristics, not from any external standard, see the comments next to each.
+
+### Sources
+
+- Antenna/frequency/RFI/calibrator-name specifics: NCRA "The GMRT: System Parameters and Current Status" (GTAC Cycle 47 status doc, 15 June 2024); NRAO VLA Observational Status Summary; CAPTURE-CASA6 source (Kale & Ishwara-Chandra 2021, ExA, 51, 95).
+- Self-cal risk-factor thresholds (calibrator-target separation, coherence time): NRAO/VLBA calibration guide.
+- `clipfluxcal`/`clipphasecal` suggestions: Perley & Butler (2017), "An Accurate Flux Density Scale from 50 MHz to 50 GHz," *ApJS*, 230, 7 ([arXiv:1609.05940](https://arxiv.org/abs/1609.05940)), the same scale CASA's `setjy` standard `'Perley-Butler 2017'` implements, valid 50 MHz-50 GHz (200 MHz-50 GHz for 3C138) so it covers GMRT and VLA bands from the same table, no separate GMRT-specific flux scale needed.
 
 ---
 
