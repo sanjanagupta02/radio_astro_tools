@@ -25,6 +25,30 @@ TELESCOPE SELECTION
     or set the TELESCOPE variable below and use execfile() from the
     CASA prompt.
 
+FITS INPUT (before you've converted to an MS)
+    You can also point this at a raw UVFITS file (.fits/.FITS) instead
+    of an MS:
+
+        casa -c read_listobs.py --telescope gmrt yourfile.FITS
+
+    This mode reads the FITS file's own header and binary tables (AN,
+    FQ, SU) directly, no MS is created, nothing is written to disk
+    except the report. It needs the 'astropy' package (pip install
+    astropy) since CASA's own msmetadata/table tools only work on an
+    MS, not raw FITS.
+
+    IMPORTANT: a raw FITS file doesn't have "scans" or "flags" yet,
+    those only get built during MS import (CASA's importgmrt task, the
+    same one CAPTURE calls internally). So FITS mode cannot report scan
+    timing, current flagging status, elevation during a specific
+    field's track, or the scan/elevation-dependent self-cal risk
+    factors, the report prints an explicit notice at the top listing
+    exactly what's skipped and why. Everything else (antennas,
+    frequency/band setup, suggested cell size/FOV/image size, field
+    classification and positions, polarization products, the risk
+    factors that don't need scan timing) is read directly from the
+    FITS file itself.
+
 ADDING A NEW TELESCOPE
     Add one entry to TELESCOPE_PROFILES with the same keys as the
     existing ones. Nothing else in the script needs to change. See
@@ -151,6 +175,12 @@ TELESCOPE_PROFILES = {
         ],
         'std_flux_cals': ['3C48', '3C147', '3C286', '0542+498', '1331+305', '0137+331'],
         'default_quack_s': 10.0,  # matches CAPTURE's config_capture.ini default
+        # Known physical dish diameter, used only in FITS mode (below) as a
+        # fallback for the field-of-view calculation, since a raw UVFITS
+        # AN table doesn't carry a dish-diameter column the way an MS's
+        # ANTENNA table does. MS mode always reads the real value from the
+        # MS itself instead of this constant. GMRT/uGMRT dishes are 45m.
+        'dish_diameter_m': 45.0,
     },
     'vla': {
         'label': 'VLA / EVLA',
@@ -190,6 +220,9 @@ TELESCOPE_PROFILES = {
         # VLA/NRAO CASA pipeline quack conventions vary by project/band;
         # there isn't a single standard value to check against here.
         'default_quack_s': None,
+        # Known physical dish diameter, used only in FITS mode as a
+        # fallback (see the GMRT profile's comment above). VLA dishes are 25m.
+        'dish_diameter_m': 25.0,
     },
     # To add another telescope (e.g. MeerKAT, ATCA), copy one of the
     # blocks above and fill in what you actually know. Leave
@@ -210,11 +243,22 @@ def flatten_cals(entry):
     return set(entry)
 
 
-# Standard Stokes/correlation type codes (CASA/AIPS convention)
+# Standard Stokes/correlation type codes, CASA MS convention (this is what
+# the MS's POLARIZATION/CORR_TYPE column uses).
 STOKES_CODES = {
     1: 'I', 2: 'Q', 3: 'U', 4: 'V',
     5: 'RR', 6: 'RL', 7: 'LR', 8: 'LL',
     9: 'XX', 10: 'XY', 11: 'YX', 12: 'YY',
+}
+
+# Stokes/correlation codes as they appear in a raw FITS header's STOKES
+# axis (CRVAL/CDELT/CRPIX), AIPS Memo 117 convention. This is a DIFFERENT
+# numbering from STOKES_CODES above (note the negative values), used only
+# by the FITS-mode functions below, never mix the two up.
+FITS_STOKES_CODES = {
+    1: 'I', 2: 'Q', 3: 'U', 4: 'V',
+    -1: 'RR', -2: 'LL', -3: 'RL', -4: 'LR',
+    -5: 'XX', -6: 'YY', -7: 'XY', -8: 'YX',
 }
 
 
@@ -229,14 +273,11 @@ def corr_type_strings(msname):
     return [STOKES_CODES.get(int(c), 'code%d' % c) for c in codes]
 
 
-def max_baseline_m(msname):
-    """Longest antenna-antenna separation in the array, in meters, from
-    the ANTENNA subtable's ECEF positions. O(n^2) over antenna pairs,
-    trivial for any real array size (fast even for hundreds of antennas)."""
-    tb_t = table()
-    tb_t.open(msname + '/ANTENNA')
-    positions = tb_t.getcol('POSITION').T  # (nant, 3)
-    tb_t.close()
+def _max_baseline_from_positions(positions):
+    """Longest pairwise separation among a set of (n, 3) antenna
+    positions, in whatever units the positions are in. O(n^2) over
+    antenna pairs, trivial for any real array size. Shared by both the
+    MS-mode and FITS-mode max-baseline functions below."""
     n = positions.shape[0]
     maxb = 0.0
     for i in range(n):
@@ -244,6 +285,16 @@ def max_baseline_m(msname):
         if d.size:
             maxb = max(maxb, float(d.max()))
     return maxb
+
+
+def max_baseline_m(msname):
+    """Longest antenna-antenna separation in the array, in meters, from
+    the ANTENNA subtable's ECEF positions."""
+    tb_t = table()
+    tb_t.open(msname + '/ANTENNA')
+    positions = tb_t.getcol('POSITION').T  # (nant, 3)
+    tb_t.close()
+    return _max_baseline_from_positions(positions)
 
 
 def dish_diameter_m(msname):
@@ -260,6 +311,166 @@ def dish_diameter_m(msname):
 
 def next_pow2(n):
     return int(2 ** np.ceil(np.log2(max(n, 1))))
+
+
+# ---------------------------------------------------------------------
+# FITS-mode helpers
+#
+# These read a raw UVFITS "random groups" file directly (the AIPS
+# convention GMRT/uGMRT correlator output uses), without ever building a
+# CASA MS. They cover only what's genuinely available before MS import:
+# antenna positions/names (AN table), frequency setup (header + FQ
+# table), polarization (header STOKES axis), source list/positions (SU
+# table, or the header's OBJECT/OBSRA/OBSDEC for single-source files),
+# and the observation time span (DATE/INTTIM random-group parameters,
+# read without touching the visibility data array itself, so this stays
+# fast regardless of file size).
+#
+# What's deliberately NOT attempted here: scan boundaries (CASA's own
+# importer infers these from time gaps per source, a nontrivial piece of
+# logic not worth silently re-implementing and risking a mismatch),
+# per-antenna/per-channel flagging status (needs the same import step,
+# and a freshly-correlated FITS file has essentially nothing flagged yet
+# anyway), and anything derived from either of those.
+# ---------------------------------------------------------------------
+
+def _require_astropy():
+    try:
+        from astropy.io import fits as pyfits
+        return pyfits
+    except ImportError:
+        raise ImportError(
+            "FITS mode needs the 'astropy' package to read UVFITS binary tables "
+            "(CASA's own msmetadata/table tools only work on Measurement Sets, "
+            "not raw FITS). Install it with: pip install astropy")
+
+
+def _fits_axis_for_ctype(header, ctype_prefix):
+    """Find which NAXISn/CRVALn/etc. axis number has a given CTYPE
+    (e.g. 'FREQ', 'STOKES'), rather than assuming a fixed axis order,
+    since that order isn't guaranteed to be the same across files."""
+    naxis = header.get('NAXIS', 0)
+    for i in range(1, naxis + 1):
+        ctype = str(header.get('CTYPE%d' % i, '')).strip().upper()
+        if ctype.startswith(ctype_prefix.upper()):
+            return i
+    return None
+
+
+def fits_telescope_name(fitsfile):
+    """TELESCOP header keyword, the FITS-mode equivalent of the MS's
+    OBSERVATION table telescope name."""
+    pyfits = _require_astropy()
+    with pyfits.open(fitsfile) as hdul:
+        return str(hdul[0].header.get('TELESCOP', '')).strip()
+
+
+def fits_antenna_info(fitsfile):
+    """Antenna names and positions from the FITS AN ('AIPS AN') table.
+    Positions are only ever used as PAIRWISE DIFFERENCES below (for max
+    baseline), so the ARRAYX/ARRAYY/ARRAYZ array-center offset in the AN
+    table's own header, which would convert these relative STABXYZ
+    values into true absolute geocentric coordinates, cancels out
+    exactly and doesn't need to be added back in."""
+    pyfits = _require_astropy()
+    with pyfits.open(fitsfile) as hdul:
+        an = hdul['AIPS AN']
+        names = [str(n).strip() for n in an.data['ANNAME']]
+        positions = np.array(an.data['STABXYZ'], dtype=float)
+    return names, positions
+
+
+def fits_frequency_info(fitsfile):
+    """Per-channel frequencies (Hz) for each IF/subband, built from the
+    primary header's FREQ axis (CRVAL/CDELT/CRPIX/NAXIS) plus the FQ
+    ('AIPS FQ') table's per-IF frequency offset, if present. Returns a
+    list of (if_index, freq_array_hz). Falls back to a single IF at the
+    header's own reference frequency if there's no FQ table or it's an
+    unexpected shape, rather than guessing a multi-IF layout."""
+    pyfits = _require_astropy()
+    with pyfits.open(fitsfile) as hdul:
+        hdr = hdul[0].header
+        freq_axis = _fits_axis_for_ctype(hdr, 'FREQ')
+        if freq_axis is None:
+            raise ValueError("No FREQ axis (CTYPEn) found in the primary header.")
+        crval = float(hdr['CRVAL%d' % freq_axis])
+        cdelt = float(hdr['CDELT%d' % freq_axis])
+        crpix = float(hdr['CRPIX%d' % freq_axis])
+        nchan = int(hdr['NAXIS%d' % freq_axis])
+        chan_idx = np.arange(1, nchan + 1)
+        base_freqs = crval + (chan_idx - crpix) * cdelt  # Hz, one IF's channels
+
+        if_offsets = np.array([0.0])
+        try:
+            fq = hdul['AIPS FQ']
+            iffreq = np.array(fq.data['IF FREQ'], dtype=float)
+            if_offsets = np.atleast_1d(iffreq[0]) if iffreq.ndim > 1 else np.atleast_1d(iffreq)
+        except Exception:
+            pass  # no FQ table, or an unexpected layout: treat as single-IF at CRVAL
+
+        return [(i, base_freqs + off) for i, off in enumerate(if_offsets)]
+
+
+def fits_polarization_products(fitsfile):
+    """Polarization products (e.g. ['RR','LL']) from the primary
+    header's STOKES axis, mapped through FITS_STOKES_CODES (the FITS
+    header convention, not the MS one, see the comment on that dict)."""
+    pyfits = _require_astropy()
+    with pyfits.open(fitsfile) as hdul:
+        hdr = hdul[0].header
+        stokes_axis = _fits_axis_for_ctype(hdr, 'STOKES')
+        if stokes_axis is None:
+            raise ValueError("No STOKES axis (CTYPEn) found in the primary header.")
+        crval = float(hdr['CRVAL%d' % stokes_axis])
+        cdelt = float(hdr['CDELT%d' % stokes_axis])
+        crpix = float(hdr['CRPIX%d' % stokes_axis])
+        npol = int(hdr['NAXIS%d' % stokes_axis])
+        codes = [int(round(crval + (i + 1 - crpix) * cdelt)) for i in range(npol)]
+    return [FITS_STOKES_CODES.get(c, 'code%d' % c) for c in codes]
+
+
+def fits_source_list(fitsfile):
+    """List of (name, ra_deg, dec_deg). Multi-source files carry this in
+    the SU ('AIPS SU') table; single-source files (no SU table) carry it
+    in the primary header's OBJECT/OBSRA/OBSDEC keywords instead."""
+    pyfits = _require_astropy()
+    with pyfits.open(fitsfile) as hdul:
+        try:
+            su = hdul['AIPS SU']
+            names = [str(n).strip() for n in su.data['SOURCE']]
+            ra = np.array(su.data['RAEPO'], dtype=float)
+            dec = np.array(su.data['DECEPO'], dtype=float)
+            return list(zip(names, ra, dec))
+        except KeyError:
+            hdr = hdul[0].header
+            name = str(hdr.get('OBJECT', 'UNKNOWN')).strip()
+            ra = hdr.get('OBSRA')
+            dec = hdr.get('OBSDEC')
+            if ra is None or dec is None:
+                raise ValueError("No AIPS SU table and no OBSRA/OBSDEC in the primary header.")
+            return [(name, float(ra), float(dec))]
+
+
+def fits_time_range_mjd_sec(fitsfile):
+    """Observation start/end as MJD-seconds (matching what the
+    elevation/sun functions below expect), plus the INTTIM random
+    parameter if present. Reads only the random-group PARAMETER columns
+    (DATE, INTTIM), not the visibility data array itself, so this stays
+    fast regardless of file size. The split-precision DATE/DATE
+    convention (two random parameters both named DATE, for JD integer +
+    fractional parts) is handled automatically: astropy's GroupData.par()
+    sums same-named parameters together, verified against a test file."""
+    pyfits = _require_astropy()
+    with pyfits.open(fitsfile) as hdul:
+        data = hdul[0].data
+        jd = np.array(data.par('DATE'), dtype=float)
+        inttim = None
+        try:
+            inttim = np.array(data.par('INTTIM'), dtype=float)
+        except Exception:
+            pass
+    mjd_sec = (jd - 2400000.5) * 86400.0
+    return float(mjd_sec.min()), float(mjd_sec.max()), inttim
 
 
 def get_integration_time(msname):
@@ -339,7 +550,7 @@ def sun_condition(elev_deg):
 
 
 def parse_args():
-    msname = None
+    input_path = None
     telescope = None
     perchannel = None  # None = use CHECK_PERCHANNEL_FLAGS default, True/False = override
     args = sys.argv[1:]
@@ -362,25 +573,40 @@ def parse_args():
             perchannel = True
             i += 1
             continue
-        if a.endswith('.ms') or a.endswith('.MS'):
-            msname = a
+        if a.endswith('.ms') or a.endswith('.MS') or a.endswith('.fits') or a.endswith('.FITS'):
+            input_path = a
         i += 1
-    return msname, telescope, perchannel
+    return input_path, telescope, perchannel
 
 
-def find_ms(msname_arg):
-    if msname_arg:
-        return msname_arg
+def find_input(input_arg):
+    """Resolve the input path: an explicit argument, the MSNAME variable
+    at the top of the script, or (if exactly one exists) whatever single
+    .ms/.MS/.fits/.FITS is sitting in the current directory."""
+    if input_arg:
+        return input_arg
     if MSNAME:
         return MSNAME
-    candidates = [d for d in os.listdir('.') if d.endswith('.ms') or d.endswith('.MS')]
+    candidates = [d for d in os.listdir('.')
+                  if d.endswith('.ms') or d.endswith('.MS')
+                  or d.endswith('.fits') or d.endswith('.FITS')]
     if len(candidates) == 1:
         return candidates[0]
     elif len(candidates) > 1:
-        raise ValueError("Multiple .ms directories found (%s). Pass one explicitly."
+        raise ValueError("Multiple candidate inputs found (%s). Pass one explicitly."
                           % ', '.join(candidates))
     else:
-        raise ValueError("No .ms file found. Set MSNAME at the top of the script or pass a path as an argument.")
+        raise ValueError("No .ms/.MS or .fits/.FITS file found. Set MSNAME at the top "
+                          "of the script or pass a path as an argument.")
+
+
+def input_kind(path):
+    if path.endswith('.ms') or path.endswith('.MS'):
+        return 'ms'
+    if path.endswith('.fits') or path.endswith('.FITS'):
+        return 'fits'
+    raise ValueError("Don't recognize the input type for '%s' (expected .ms/.MS or "
+                      ".fits/.FITS)." % path)
 
 
 def detect_telescope(obs_name):
@@ -455,9 +681,7 @@ def safe(fn, default=None):
         return "unavailable (%s)" % e
 
 
-def main():
-    msname_arg, telescope_arg, perchannel_arg = parse_args()
-    msname = find_ms(msname_arg)
+def main_ms(msname, telescope_arg, perchannel_arg):
     check_perchannel = CHECK_PERCHANNEL_FLAGS if perchannel_arg is None else perchannel_arg
     lines = []
 
@@ -944,6 +1168,296 @@ def main():
     with open('read_listobs_report.txt', 'w') as fh:
         fh.write('\n'.join(lines) + '\n')
     print("\nReport saved to read_listobs_report.txt")
+
+
+def main_fits(fitspath, telescope_arg):
+    lines = []
+
+    def out(s=""):
+        print(s)
+        lines.append(s)
+
+    out("=" * 72)
+    out(" read_listobs.py SUMMARY (FITS mode): %s" % fitspath)
+    out("=" * 72)
+    out("\n! FITS MODE: built directly from the FITS file, no MS was created and nothing")
+    out("  was written to disk except this report. A raw FITS file doesn't have \"scans\" or")
+    out("  \"flags\" yet (those only get built during MS import, e.g. CASA's importgmrt), so")
+    out("  the following MS-mode sections are NOT available here and are skipped: SCAN TIMING")
+    out("  PER FIELD, ELEVATION DURING TRACK, CURRENT FLAGGING STATUS, and the elevation-/")
+    out("  scan-length-dependent self-cal risk factors. Everything else below (antennas,")
+    out("  frequency/band setup, suggested cell size/FOV/image size, field classification and")
+    out("  positions, polarization products, the risk factors that don't need scan timing) is")
+    out("  read directly from the FITS file's own header and binary tables (AN/FQ/SU).")
+
+    # ---------------- basic info + telescope profile ----------------
+    out("\nBASIC INFO")
+    try:
+        obsname = fits_telescope_name(fitspath)
+    except Exception as e:
+        obsname = ""
+        out("  Observatory (from FITS) : unavailable (%s)" % e)
+    else:
+        out("  Observatory (from FITS) : %s" % (obsname or "(unknown)"))
+
+    try:
+        sources = fits_source_list(fitspath)
+    except Exception as e:
+        sources = []
+        out("  Total fields             : unavailable (%s)" % e)
+    else:
+        out("  Total fields             : %d" % len(sources))
+    out("  Total scans              : not available in FITS mode (needs MS import)")
+
+    telescope_key = resolve_telescope(telescope_arg, obsname, out)
+    profile = TELESCOPE_PROFILES[telescope_key]
+
+    # ---------------- observation time range / observing conditions ----------------
+    qa_t = quanta()
+    me_t = measures()
+    out("\nOBSERVATION TIME RANGE / OBSERVING CONDITIONS")
+    obs_t0 = obs_t1 = None
+    inttim_arr = None
+    try:
+        obs_t0, obs_t1, inttim_arr = fits_time_range_mjd_sec(fitspath)
+        d0 = qa_t.time(qa_t.quantity(obs_t0, 's'), form='ymd')[0]
+        d1 = qa_t.time(qa_t.quantity(obs_t1, 's'), form='ymd')[0]
+        out("  Observation window      : %s to %s (%.1f min)" % (d0, d1, (obs_t1 - obs_t0) / 60.0))
+        out("  (Full span covered by the file's DATE parameters, not scan-by-scan timing,")
+        out("  that needs MS import.)")
+    except Exception as e:
+        out("  Observation window: unavailable (%s)" % e)
+
+    obspos = get_observatory_position(me_t, [obsname, profile.get('measures_site_name')])
+
+    sun_conditions = []
+    if obspos is not None and obs_t0 is not None:
+        try:
+            for label, t in (("start", obs_t0), ("mid", (obs_t0 + obs_t1) / 2.0), ("end", obs_t1)):
+                sel = sun_elevation_deg(me_t, qa_t, obspos, t)
+                cond = sun_condition(sel)
+                sun_conditions.append((label, sel, cond))
+                out("  Sun elevation at %-5s: %6.1f deg (%s)" % (label, sel, cond))
+        except Exception as e:
+            out("  Sun elevation unavailable (%s)" % e)
+    else:
+        out("  Could not resolve an observatory position for '%s' in CASA's Observatories"
+            % (obsname or profile['label']))
+        out("  table, so day/night/elevation checks are skipped.")
+
+    # ---------------- antennas ----------------
+    out("\nANTENNAS")
+    ant_names = []
+    ant_positions = None
+    try:
+        ant_names, ant_positions = fits_antenna_info(fitspath)
+        out("  Count: %d" % len(ant_names))
+        out("  Names: %s" % ', '.join(ant_names))
+        odd = [a for a in ant_names if not profile['antenna_pattern'].match(a)]
+        if odd:
+            out("  ! Name(s) that don't match the expected %s naming pattern (informational, verify manually): %s"
+                % (profile['label'], ', '.join(odd)))
+    except Exception as e:
+        out("  unavailable (%s)" % e)
+
+    # ---------------- frequency setup ----------------
+    out("\nFREQUENCY SETUP")
+    center_freq_hz = None
+    band_name = None
+    cell_lo = cell_hi = cell_default = None
+    try:
+        subbands = fits_frequency_info(fitspath)
+        out("  Number of IFs/subbands: %d" % len(subbands))
+        all_subband_freqs = []
+        for i, freqs in subbands:
+            all_subband_freqs.append(freqs)
+            out("  IF %d: %d channels, range %.3f-%.3f MHz" % (i, len(freqs), freqs.min() / 1e6, freqs.max() / 1e6))
+        allf = np.concatenate(all_subband_freqs)
+        center_freq_hz = (allf.min() + allf.max()) / 2.0
+        band_name = guess_band(center_freq_hz, profile['band_ranges'])
+        out("  Overall range: %.3f-%.3f MHz, center %.3f MHz" % (allf.min() / 1e6, allf.max() / 1e6, center_freq_hz / 1e6))
+        out("  Likely band (%s): %s" % (profile['label'], band_name))
+
+        if ant_positions is not None and len(ant_positions) >= 2:
+            try:
+                bmax = _max_baseline_from_positions(ant_positions)
+                wavelength_m = 299792458.0 / center_freq_hz
+                beam_arcsec = 206265.0 * wavelength_m / bmax
+                cell_lo, cell_hi = beam_arcsec / 5.0, beam_arcsec / 3.0
+                cell_default = beam_arcsec / 4.0
+                out("  Max baseline: %.0f m -> synthesized beam ~%.2f arcsec (natural weighting, "
+                    "no tapering)" % (bmax, beam_arcsec))
+                out("  Suggested cell size: ~%.2f-%.2f arcsec (3-5 px/beam), %.2f arcsec if you just want one number (4 px/beam)"
+                    % (cell_lo, cell_hi, cell_default))
+
+                ddiam = profile.get('dish_diameter_m')
+                if ddiam and cell_default:
+                    fov_arcsec = 206265.0 * wavelength_m / ddiam
+                    imsize_needed = fov_arcsec / cell_default
+                    imsize_pow2 = next_pow2(imsize_needed)
+                    out("  Dish diameter: %.1f m (known %s constant, not read from the FITS file) -> field of "
+                        "view ~%.1f arcsec (%.2f arcmin)" % (ddiam, profile['label'], fov_arcsec, fov_arcsec / 60.0))
+                    out("  Suggested image size: %d px (next power of 2 above the %.0f px the FOV/cell needs)"
+                        % (imsize_pow2, imsize_needed))
+            except Exception as e:
+                out("  Suggested cell size / FOV / image size unavailable (%s)" % e)
+
+        if profile['rfi_bands']:
+            hits = [(lo, hi) for lo, hi in profile['rfi_bands'] if np.any((allf >= lo) & (allf <= hi))]
+            if hits:
+                out("  ! Known RFI-prone frequency range(s) fall inside your band:")
+                for lo, hi in hits:
+                    out("      %.1f-%.1f MHz" % (lo / 1e6, hi / 1e6))
+            else:
+                out("  No overlap with this profile's known persistent-RFI list.")
+        else:
+            out("  (No curated RFI-frequency list for %s in this script yet, not checked.)" % profile['label'])
+    except Exception as e:
+        out("  unavailable (%s)" % e)
+
+    # polarization products
+    pol_products = []
+    try:
+        pol_products = fits_polarization_products(fitspath)
+        out("  Polarization products: %s" % ', '.join(pol_products))
+    except Exception as e:
+        out("  Polarization products: unavailable (%s)" % e)
+
+    # integration time
+    try:
+        if inttim_arr is not None and len(inttim_arr):
+            out("  Integration time (median INTTIM parameter): %.2f s" % float(np.median(inttim_arr)))
+        else:
+            out("  Integration time: no INTTIM parameter in this file, unavailable without MS import.")
+    except Exception as e:
+        out("  Integration time: unavailable (%s)" % e)
+
+    # ---------------- field classification ----------------
+    out("\nFIELD CLASSIFICATION")
+    phase_cals, phase_cal_warn = load_phase_cals(PHASE_CAL_FILE)
+    if phase_cal_warn:
+        out("  " + phase_cal_warn)
+    flux_cals = flatten_cals(profile['std_flux_cals'])
+    fields = [s[0] for s in sources]
+    field_radec = {s[0]: (s[1], s[2]) for s in sources}
+    ampcals, pcals, targets = classify_fields(fields, phase_cals, flux_cals)
+    out("  Flux/bandpass calibrators : %s" % (', '.join(ampcals) if ampcals else '(none found)'))
+    out("  Phase calibrators         : %s" % (', '.join(pcals) if pcals else '(none found)'))
+    out("  Targets                   : %s" % (', '.join(targets) if targets else '(none found)'))
+
+    callike_targets = [t for t in targets if CALLIKE_NAME.match(t)]
+    if callike_targets:
+        out("  ! These 'targets' have coordinate-style names typical of calibrators,")
+        out("    but aren't in %s or this profile's standard list. Verify they aren't" % PHASE_CAL_FILE)
+        out("    meant to be a phase calibrator (a missing catalog entry will make a")
+        out("    pipeline treat them as the science target):")
+        out("      %s" % ', '.join(callike_targets))
+
+    if ampcals and not pcals:
+        out("  ! No separate phase calibrator found. Pipelines that fall back to using")
+        out("    the amplitude/bandpass calibrator as the phase calibrator (e.g. CAPTURE)")
+        out("    will pick the one with the most scans. Confirm that's what you want.")
+
+    # ---------------- field positions ----------------
+    out("\nFIELD POSITIONS")
+    for fname, (ra_deg, dec_deg) in field_radec.items():
+        out("  %-20s RA %s   Dec %s" % (fname, deg_to_hms(ra_deg), deg_to_dms(dec_deg)))
+
+    max_cal_sep_deg = None
+    if ampcals or pcals:
+        out("\n  Calibrator-target separations:")
+        for cal in ampcals + pcals:
+            if cal not in field_radec:
+                continue
+            for tgt in targets:
+                if tgt not in field_radec:
+                    continue
+                sep = angsep_deg(field_radec[cal][0], field_radec[cal][1],
+                                  field_radec[tgt][0], field_radec[tgt][1])
+                out("    %s <-> %s : %.1f deg" % (cal, tgt, sep))
+                if max_cal_sep_deg is None or sep > max_cal_sep_deg:
+                    max_cal_sep_deg = sep
+        out("    (No universal cutoff here, but the larger this separation is, the less")
+        out("     that calibrator's gain/phase solutions represent the sky above your")
+        out("     target, especially if it's serving as your only calibrator.)")
+
+    out("\nSCAN TIMING PER FIELD: not available in FITS mode (needs MS import).")
+    out("\nELEVATION DURING TRACK: not available in FITS mode (needs scan timing from an MS).")
+    out("\nCURRENT FLAGGING STATUS: not available in FITS mode (needs MS import; a freshly")
+    out("  correlated file also has essentially nothing flagged yet anyway).")
+
+    # ---------------- self-calibration risk factors (partial in FITS mode) ----------------
+    out("\nSELF-CALIBRATION RISK FACTORS (heuristic, not a verdict, partial in FITS mode)")
+    risk_factors = []
+
+    if band_name:
+        low_freq = ('Legacy' in band_name) or band_name in ('uGMRT Band 2', 'uGMRT Band 3', 'uGMRT Band 4',
+                                                              '4-band', 'P-band')
+        if low_freq:
+            risk_factors.append("Low-frequency band (%s): ionospheric phase noise scales as 1/freq^2, "
+                                 "usually the single biggest driver of selfcal need at these frequencies "
+                                 "on %s." % (band_name, profile['label']))
+
+    for label, sel, cond in sun_conditions:
+        if 'twilight' in cond:
+            risk_factors.append("Sun near horizon at track %s (%.1f deg): terminator crossings bring "
+                                 "rapid ionospheric TEC gradients, often the roughest part of a day." % (label, sel))
+        elif cond == 'daytime':
+            risk_factors.append("Track %s is in local daytime (sun %.1f deg): daytime ionosphere is "
+                                 "more disturbed than night." % (label, sel))
+
+    if ampcals and not pcals:
+        risk_factors.append("No separate phase calibrator: nothing is cycling in to track time-variable "
+                             "phase during the target scans, selfcal is doing that job instead.")
+
+    sep_limit_deg = 5.7 if (center_freq_hz and center_freq_hz >= 5e9) else 4.0
+    if max_cal_sep_deg is not None and max_cal_sep_deg > sep_limit_deg:
+        risk_factors.append("Calibrator-target separation is %.1f deg, beyond the ~%.1f deg the NRAO/VLBA "
+                             "calibration guide recommends at this frequency for phase referencing: phase "
+                             "solutions from a calibrator this far away represent a different patch of "
+                             "sky/atmosphere." % (max_cal_sep_deg, sep_limit_deg))
+
+    out("  (Elevation-during-track and long-uninterrupted-scan risk factors need scan timing")
+    out("  from an MS, skipped here.)")
+
+    if risk_factors:
+        for r in risk_factors:
+            out("  ! " + r)
+    else:
+        out("  No red flags found in what FITS mode could check.")
+    out("  This is a heuristic from metadata alone, not a measurement. The actual test is")
+    out("  looking at the real data: phase vs time on the calibrator/target after the first")
+    out("  calibration pass, or dynamic range and artifacts in a first dirty/CLEANed image.")
+
+    # ---------------- checklist ----------------
+    out("\nCHECKLIST")
+    out("  [ ] Calibrator names match IAU standard form or an entry in %s" % PHASE_CAL_FILE)
+    out("  [ ] %s is present and up to date in this directory" % PHASE_CAL_FILE)
+    out("  [ ] ref_ant in your pipeline config will actually be present once this becomes an MS")
+    out("      (check the Names list under ANTENNAS above; MS import keeps the same antenna list)")
+    if cell_lo is not None:
+        out("  [ ] when imaging the data, use a cell size in the ~%.2f-%.2f arcsec range suggested above"
+            " (or %.2f as a single value)" % (cell_lo, cell_hi, cell_default))
+    else:
+        out("  [ ] when imaging the data, pick a cell size matching the band identified above"
+            " (suggestion unavailable this run)")
+    if callike_targets:
+        out("  [ ] the coordinate-named 'target' field(s) flagged above have been double-checked")
+    out("=" * 72)
+
+    with open('read_listobs_report.txt', 'w') as fh:
+        fh.write('\n'.join(lines) + '\n')
+    print("\nReport saved to read_listobs_report.txt")
+
+
+def main():
+    input_arg, telescope_arg, perchannel_arg = parse_args()
+    input_path = find_input(input_arg)
+    kind = input_kind(input_path)
+    if kind == 'fits':
+        main_fits(input_path, telescope_arg)
+    else:
+        main_ms(input_path, telescope_arg, perchannel_arg)
 
 
 if __name__ == '__main__':
