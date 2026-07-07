@@ -6,6 +6,7 @@ Small, standalone tools for GMRT/uGMRT and VLA radio observations. Nothing here 
 
 - [`read_listobs.py`](#read_listobspy) — read-only pre-flight check on an existing measurement set (antennas, frequency setup, flagging, RFI, scan timing, self-cal risk factors)
 - [`radio_sn_detectability.py`](#radio_sn_detectabilitypy) — proposal-planning sensitivity/detectability calculator, for before you have data
+- [`sort_gmrt_files.py`](#sort_gmrt_filespy) — sorts raw GMRT/uGMRT downloads (lta-derived logs + FITS) into per-object folders, with a summary CSV
 
 ---
 
@@ -117,3 +118,42 @@ python radio_sn_detectability.py --telescope gmrt --compare-bands \
 | `--loss-fraction` | `0.0` | Fraction of integration time assumed lost to RFI/flagging |
 | `--list-bands` | — | List available bands and per-dish SEFD for `--telescope`, then exit |
 | `--compare-bands` | — | Run the calculation across every band for `--telescope` and print a comparison table, instead of a single `--band` |
+
+---
+
+## `sort_gmrt_files.py`
+
+### What it does
+
+Sorts raw GMRT/uGMRT download files (`.obslog`, `.gvfits.log`, `.listscan.log`, `.listscan.plan`, and the converted `.fits`) into one folder per astronomical object: `<OBJECT_NAME>/gmrt_data/`. Every session also gets a row in a summary CSV: date of observation, band/RF frequency, calibrators seen, approximate time on target, project code/name, and which files were moved.
+
+It doesn't touch CASA or a measurement set. It groups files by the proposal/date/band tag embedded in GMRT's raw filenames, works out which source in each session is a calibrator vs. the target, and files things accordingly.
+
+### How it operates
+
+Target identification reads the small text logs first: `.listscan.log` (or `.gvfits.log` as a fallback) already lists every source observed in a session, scan by scan, along with the true UT observation date. Anything matching a standard GMRT/VLA flux calibrator name or the coordinate-style naming convention used for phase calibrators is treated as a calibrator (extendable via `--extra-calibrators`); whatever's left is the target. Because these logs are a few KB, sorting normally happens without ever opening the FITS file (which can run tens of GB) or needing `astropy` installed. If no text logs are present for a session, it falls back to opening the FITS file directly and reading the AIPS SU source table, or the `OBJECT` header keyword, which does require `astropy`.
+
+If a session's target can't be identified (only calibrators visible, or nothing to read), it gets its own placeholder folder (`object_1`, `object_2`, ...) instead of being lumped into one shared "unknown" bucket, since two unidentified sessions aren't necessarily the same real object.
+
+Object folders are matched case-insensitively, so `2020bvc` and `2020BVC` from different sessions land in the same folder instead of creating a duplicate. Re-running the script against the same destination appends new rows to the CSV rather than overwriting it, and skips (with a warning) any file that would otherwise clobber an identically-named file already sitting in the destination.
+
+### Usage
+
+```bash
+python sort_gmrt_files.py                                   # sorts the current folder in place
+python sort_gmrt_files.py --src /path/to/downloads --dst /path/to/sorted
+python sort_gmrt_files.py --dry-run                          # preview without touching any files
+python sort_gmrt_files.py --copy                             # copy instead of move
+```
+
+### Optional flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--src` | current folder | Folder containing the raw downloaded files |
+| `--dst` | same as `--src` | Destination base folder for the sorted object folders |
+| `--copy` | off (moves) | Copy files instead of moving them |
+| `--dry-run` | off | Show what would happen without touching any files |
+| `--extra-calibrators` | — | Text file, one calibrator name per line, to extend the built-in calibrator list |
+| `--csv` | `gmrt_sort_summary.csv` | Filename for the summary CSV (written into `--dst`) |
+| `--unknown-prefix` | `object` | Prefix used to name sessions where no target could be identified |
