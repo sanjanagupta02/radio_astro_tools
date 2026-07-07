@@ -231,6 +231,132 @@ TELESCOPE_PROFILES = {
 }
 
 
+# ---------------------------------------------------------------------
+# Perley & Butler (2017) absolute flux density scale, "An Accurate Flux
+# Density Scale from 50 MHz to 50 GHz" (Perley & Butler 2017, ApJS 230,
+# 7; arXiv:1609.05940, Table 5). Valid 50 MHz-50 GHz for 3C48/3C147/
+# 3C286, 200 MHz-50 GHz for 3C138, so this single scale covers both
+# GMRT/uGMRT and VLA bands, it's the same model CASA's own setjy
+# 'Perley-Butler 2017' standard implements (i.e. what CAPTURE's own
+# setjy() call already uses internally once you get to doinitcal). No
+# separate GMRT-only flux scale is needed, this paper explicitly
+# supersedes/reconciles with the Scaife & Heald (2012) low-frequency
+# scale most older GMRT work cites (their Table 7 shows agreement to a
+# few percent for these sources).
+#
+#   log10(S_Jy) = a0 + a1*log10(f_GHz) + a2*log10(f_GHz)^2 + ...
+#
+# value: (coefficients a0..a5, freq_lo_GHz, freq_hi_GHz)
+# ---------------------------------------------------------------------
+PERLEY_BUTLER_2017 = {
+    '3C48':  ((1.3253, -0.7553, -0.1914, 0.0498, None, None), 0.05, 50.0),
+    '3C138': ((1.0088, -0.4981, -0.1550, -0.0100, 0.0220, None), 0.20, 50.0),
+    '3C147': ((1.4516, -0.6961, -0.2010, 0.0640, -0.0460, 0.0290), 0.05, 50.0),
+    '3C286': ((1.2481, -0.4507, -0.1798, 0.0357, None, None), 0.05, 50.0),
+}
+
+# Margin applied above the computed expected flux to get a suggested
+# clip ceiling (floor is 0, matching config_capture.ini's own template
+# convention for clipfluxcal/clipphasecal). This factor is this
+# script's own choice, not something from the Perley & Butler paper,
+# meant to allow for resolution effects and antenna-based gain scatter
+# in the RAW (pre-calibration) visibility amplitudes that
+# clipfluxcal/clipphasecal actually clip against. Tune it if it's too
+# tight (clipping real data) or too loose (letting obvious garbage
+# through) for what you see in practice.
+CLIP_MARGIN_FACTOR = 2.0
+
+# GMRT's std_flux_cals is a flat list mixing canonical 3C names and
+# their coordinate-alias forms for the same four sources (VLA's
+# std_flux_cals is a dict that already groups these, see TELESCOPE_
+# PROFILES above). Used only to resolve a flat-list alias back to its
+# canonical PERLEY_BUTLER_2017 key.
+_FLAT_LIST_COORD_ALIASES = {'0542+498': '3C147', '1331+305': '3C286', '0137+331': '3C48'}
+
+
+def perley_butler_flux_jy(canonical_name, freq_hz):
+    """Expected flux density in Jy for a standard Perley & Butler (2017)
+    calibrator at a given frequency. Returns (flux_jy, warning_or_None);
+    warning is set (flux_jy is still returned) if freq_hz falls outside
+    the range this source's fit was actually validated over,
+    extrapolating a little past that edge is common practice but worth
+    flagging rather than presenting silently as equally solid."""
+    entry = PERLEY_BUTLER_2017.get(canonical_name)
+    if entry is None:
+        return None, None
+    coeffs, flo, fhi = entry
+    freq_ghz = freq_hz / 1e9
+    warning = None
+    if not (flo <= freq_ghz <= fhi):
+        warning = ("%.3f GHz is outside the %.2f-%.0f GHz range Perley & Butler (2017) actually "
+                    "fit %s over; treat this as an extrapolation." % (freq_ghz, flo, fhi, canonical_name))
+    logf = np.log10(freq_ghz)
+    log_s = 0.0
+    for i, a in enumerate(coeffs):
+        if a is None:
+            continue
+        log_s += a * (logf ** i)
+    return float(10 ** log_s), warning
+
+
+def canonical_calibrator_name(field_name, std_flux_cals):
+    """Map a field name, however it's spelled in this particular MS/
+    FITS file (e.g. '0137+331', 'J0137+3309', or '3C48'), back to the
+    canonical PERLEY_BUTLER_2017 key, using this telescope profile's
+    own std_flux_cals entry (flat list, or canonical->aliases dict) to
+    do the matching. Returns None if this isn't a source with a
+    Perley & Butler fit in this script."""
+    if isinstance(std_flux_cals, dict):
+        for canonical, aliases in std_flux_cals.items():
+            if field_name in aliases and canonical in PERLEY_BUTLER_2017:
+                return canonical
+        return None
+    if field_name in PERLEY_BUTLER_2017:
+        return field_name
+    return _FLAT_LIST_COORD_ALIASES.get(field_name)
+
+
+def print_clip_suggestions(out, ampcals, pcals, center_freq_hz, profile):
+    """Suggested clipfluxcal/clipphasecal ranges for config_capture.ini,
+    computed from the Perley & Butler (2017) expected flux of whichever
+    of your flux calibrator(s) is a recognized standard source, at this
+    MS/FITS's own center frequency. cliptarget and clipresid aren't
+    attempted here, there's no way to know a target's flux ahead of
+    detecting it, and clipresid isn't about source flux at all, see the
+    chat discussion, the pipeline's own defaults are the right call for
+    those two."""
+    out("\nSUGGESTED AMPLITUDE CLIP RANGES (config_capture.ini clipfluxcal/clipphasecal)")
+    if center_freq_hz is None:
+        out("  Unavailable, no center frequency computed this run.")
+        return
+    if not ampcals:
+        out("  No flux/bandpass calibrator identified, nothing to compute this for.")
+        return
+
+    for cal in ampcals:
+        canon = canonical_calibrator_name(cal, profile['std_flux_cals'])
+        if canon is None:
+            out("  %-20s not a source with a Perley & Butler (2017) flux-scale fit in this script, "
+                "no suggestion." % cal)
+            continue
+        flux_jy, warning = perley_butler_flux_jy(canon, center_freq_hz)
+        lo, hi = 0.0, CLIP_MARGIN_FACTOR * flux_jy
+        out("  %-20s expected ~%.2f Jy at %.3f GHz (Perley & Butler 2017, %s) -> suggested "
+            "clipfluxcal = %.1f,%.1f" % (cal, flux_jy, center_freq_hz / 1e9, canon, lo, hi))
+        if warning:
+            out("      ! %s" % warning)
+
+    if pcals:
+        out("  Phase calibrator(s) (%s) aren't standard flux-scale sources, no computed value here, "
+            "use a generous window (the pipeline default, or your own catalog estimate for this "
+            "specific source)." % ', '.join(pcals))
+    elif ampcals:
+        out("  No separate phase calibrator: whichever flux calibrator above CAPTURE picks to also")
+        out("  serve as the phase calibrator (the one with the most scans, see the FIELD CLASSIFICATION")
+        out("  note above), the suggested range for it applies to clipphasecal too, it's the exact")
+        out("  same physical source.")
+
+
 def flatten_cals(entry):
     """std_flux_cals can be a flat list of names, or a dict of
     canonical_name -> [aliases]. Either way, return the flat set of
@@ -888,6 +1014,8 @@ def main_ms(msname, telescope_arg, perchannel_arg):
         out("    the amplitude/bandpass calibrator as the phase calibrator (e.g. CAPTURE)")
         out("    will pick the one with the most scans. Confirm that's what you want.")
 
+    print_clip_suggestions(out, ampcals, pcals, center_freq_hz, profile)
+
     # ---------------- field positions ----------------
     out("\nFIELD POSITIONS")
     field_radec = {}
@@ -1357,6 +1485,8 @@ def main_fits(fitspath, telescope_arg):
         out("  ! No separate phase calibrator found. Pipelines that fall back to using")
         out("    the amplitude/bandpass calibrator as the phase calibrator (e.g. CAPTURE)")
         out("    will pick the one with the most scans. Confirm that's what you want.")
+
+    print_clip_suggestions(out, ampcals, pcals, center_freq_hz, profile)
 
     # ---------------- field positions ----------------
     out("\nFIELD POSITIONS")
